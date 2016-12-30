@@ -57,12 +57,23 @@
 
 #define MIN_DOWN_FORCE          10.0f
 #define MAX_DOWN_FORCE          1e4f
-#define MIN_ANGULAR_VEL_LIMIT   (-10.0f)
 #define MAX_ANGULAR_VEL_LIMIT   10.0f
+#define LINEAR_VEL_LIMIT_MPH    140.0f
+#define VEL_TO_MPH              (3.6f/1.60934f)
+#define MAX_LINEAR_VEL_LIMIT    (LINEAR_VEL_LIMIT_MPH/VEL_TO_MPH)
 
 #define AUDIO_FIXED_FREQ_44K    44100.0f
 #define MIN_SHOCK_IMPACT_VEL    3.0f
 #define MAX_SKID_TRACK_SPEED    70.0f
+#define MIN_SIDE_SLIP_VEL       4.0f
+
+#define MIN_WHEEL_RPM           0.60f
+#define MAX_WHEEL_RPM           0.75f
+#define MIN_WHEEL_RPM_AIR       0.89f
+#define MAX_WHEEL_RPM_AIR       0.90f
+
+#define MIN_PEELOUT_VAL_AT_ZER0 0.8f
+#define MAX_REAR_SLIP           0.6f
 
 //=============================================================================
 //=============================================================================
@@ -71,7 +82,7 @@ Vehicle::Vehicle(Context* context)
     , steering_( 0.0f )
 {
     // fixed update() for inputs and post update() to sync wheels for rendering
-    SetUpdateEventMask( USE_FIXEDUPDATE | USE_POSTUPDATE );
+    SetUpdateEventMask( USE_FIXEDUPDATE | USE_FIXEDPOSTUPDATE| USE_POSTUPDATE );
 
     m_fVehicleMass = 100.0f;
     m_fEngineForce = 0.0f;
@@ -90,7 +101,7 @@ Vehicle::Vehicle(Context* context)
     m_fsuspensionStiffness = 20.0f;
     m_fsuspensionDamping = 2.0f;
     m_fsuspensionCompression = 5.0f;
-    m_frollInfluence = 0.01f;
+    m_frollInfluence = 0.1f;
     m_fsuspensionRestLength = 0.6f;
     m_fsideFrictionStiffness = 0.5f;
 
@@ -119,6 +130,9 @@ Vehicle::Vehicle(Context* context)
 
     // wheel nodes
     m_vpNodeWheel.Clear();
+
+    // sound
+    playAccelerationSoundInAir_ = true;
 
 }
 
@@ -168,7 +182,12 @@ void Vehicle::Init()
     hullObject->SetMaterial(cache->GetResource<Material>("Offroad/Models/Materials/offroadVehicle.xml"));
     hullObject->SetCastShadows(true);
 
-    hullColShape->SetConvexHull(vehModel);
+    // set convex hull and resize local AABB.Y size
+    Model *vehColModel = cache->GetResource<Model>("Offroad/Models/vehCollision.mdl");
+    hullColShape->SetConvexHull(vehColModel);
+    raycastVehicle_->CompoundScaleLocalAabbMin(Vector3(0.7f, 0.5f, 1.0f));
+    raycastVehicle_->CompoundScaleLocalAabbMax(Vector3(0.7f, 0.5f, 1.0f));
+
     bool isFrontWheel=true;
     Vector3 wheelDirectionCS0(0,-1,0);
     Vector3 wheelAxleCS(-1,0,0);
@@ -195,6 +214,8 @@ void Vehicle::Init()
     raycastVehicle_->AddWheel(connectionPointCS0,wheelDirectionCS0,wheelAxleCS,m_fsuspensionRestLength,m_fwheelRadius,isFrontWheel);
 
     numWheels_ = raycastVehicle_->GetNumWheels();
+    prevWheelInContact_.Resize(numWheels_);
+
     for ( int i = 0; i < numWheels_; i++ )
     {
         btWheelInfo& wheel = raycastVehicle_->GetWheelInfo( i );
@@ -204,15 +225,17 @@ void Vehicle::Init()
         wheel.m_frictionSlip = m_fwheelFriction;
         wheel.m_rollInfluence = m_frollInfluence;
 
+        prevWheelInContact_[i] = false;
+
         // side friction stiffness is different for front and rear wheels
         if (i < 2)
         {
-            wheel.m_sideFrictionStiffness = 1.0f;
+            wheel.m_sideFrictionStiffness = 0.9f;
         }
         else
         {
-            m_fRearSlip = 0.8f;
-            wheel.m_sideFrictionStiffness = 0.8f;
+            m_fRearSlip = MAX_REAR_SLIP;
+            wheel.m_sideFrictionStiffness = MAX_REAR_SLIP;
         }
     }
 
@@ -300,9 +323,13 @@ void Vehicle::Init()
     shockSoundSrc_->SetSoundType(SOUND_EFFECT);
     shockSoundSrc_->SetGain(0.7f);
     shockSoundSrc_->SetDistanceAttenuation( 1.0f, 30.0f, 0.1f );
+
+    // acceleration sound while in air - most probably want this on
+    playAccelerationSoundInAir_ = false;
 }
 
 //=============================================================================
+// physics tick
 //=============================================================================
 void Vehicle::FixedUpdate(float timeStep)
 {
@@ -344,7 +371,7 @@ void Vehicle::FixedUpdate(float timeStep)
 
     ApplyDownwardForce();
 
-    LimitAngularVelocity();
+    LimitLinearAndAngularVelocity();
 
     AutoCorrectPitchRoll();
 
@@ -353,39 +380,128 @@ void Vehicle::FixedUpdate(float timeStep)
 }
 
 //=============================================================================
-// sync wheels for rendering
+// physics tick
 //=============================================================================
-void Vehicle::PostUpdate(float timeStep)
+void Vehicle::FixedPostUpdate(float timeStep)
 {
     float curSpdMph = GetSpeedMPH();
 
     // clear contact states
     prevWheelContacts_ = numWheelContacts_;
     numWheelContacts_ = 0;
+    float wheelVelocity = 0.0f;
+    Vector3 linVel = raycastVehicle_->GetLinearVelocity();
 
     for ( int i = 0; i < raycastVehicle_->GetNumWheels(); i++ )
     {
         btWheelInfo &whInfo = raycastVehicle_->GetWheelInfo( i );
 
         // adjust wheel rotation based on acceleration
-        if ( curGearIdx_ == 0 && currentAcceleration_ > 0.0f )
+        if ( (curGearIdx_ == 0 || !whInfo.m_raycastInfo.m_isInContact ) && currentAcceleration_ > 0.0f )
         {
-            if ( whInfo.m_skidInfoCumulative > 0.05f )
+            // peel out on 1st gear
+            if ( curGearIdx_ == 0 && whInfo.m_skidInfoCumulative > MIN_PEELOUT_VAL_AT_ZER0)
+            {
+                whInfo.m_skidInfoCumulative = MIN_PEELOUT_VAL_AT_ZER0;
+            }
+
+            if (whInfo.m_skidInfoCumulative > 0.05f)
             {
                 whInfo.m_skidInfoCumulative -= 0.002f;
             }
+
             float deltaRotation = (gearShiftSpeed_[curGearIdx_] * (1.0f - whInfo.m_skidInfoCumulative) * timeStep) / (whInfo.m_wheelsRadius);
 
             if ( deltaRotation > whInfo.m_deltaRotation )
             {
+                whInfo.m_rotation += deltaRotation - whInfo.m_deltaRotation;
                 whInfo.m_deltaRotation = deltaRotation;
-                whInfo.m_rotation += whInfo.m_deltaRotation;
             }
         }
         else
         {
             whInfo.m_skidInfoCumulative = whInfo.m_skidInfo;
+
+            if (!whInfo.m_raycastInfo.m_isInContact && currentAcceleration_ < M_EPSILON)
+            {
+                whInfo.m_rotation *= 0.95f;
+                whInfo.m_deltaRotation *= 0.95f;
+            }
         }
+
+        // ground contact
+        float whSlipVel = 0.0f;
+        if ( whInfo.m_raycastInfo.m_isInContact )
+        {
+            numWheelContacts_++;
+
+            // check side velocity slip
+            whSlipVel = Abs(ToVector3(whInfo.m_raycastInfo.m_wheelAxleWS).DotProduct(linVel));
+
+            if ( whSlipVel > MIN_SIDE_SLIP_VEL )
+            {
+                whInfo.m_skidInfoCumulative = (whInfo.m_skidInfoCumulative > 0.9f)?0.89f:whInfo.m_skidInfoCumulative;
+            }
+        }
+
+        // wheel velocity from rotation
+        // note (correct eqn): raycastVehicle_->GetLinearVelocity().Length() ~= whInfo.m_deltaRotation * whInfo.m_wheelsRadius)/timeStep
+        wheelVelocity += (whInfo.m_deltaRotation * whInfo.m_wheelsRadius)/timeStep;
+    }
+
+    // set cur rpm based on wheel rpm
+    int numPoweredWheels = raycastVehicle_->GetNumWheels();
+
+    // adjust rpm based on wheel speed
+    if (curGearIdx_ == 0 || numWheelContacts_ == 0)
+    {
+        // average wheel velocity
+        wheelVelocity /= (float)numPoweredWheels;
+
+        // physics velocity to kmh to mph (based on Bullet's calculation for KmH)
+        wheelVelocity = wheelVelocity * 3.6f * KMH_TO_MPH;
+        float wheelRPM = upShiftRPM_ * wheelVelocity / gearShiftSpeed_[curGearIdx_];
+
+        if (curGearIdx_ == 0)
+        {
+            if ( wheelRPM > upShiftRPM_ * MAX_WHEEL_RPM )
+            {
+                wheelRPM = upShiftRPM_ * Random(MIN_WHEEL_RPM, MAX_WHEEL_RPM);
+            }
+        }
+        else
+        {
+            if (playAccelerationSoundInAir_)
+            {
+                if (wheelRPM > upShiftRPM_ * MAX_WHEEL_RPM_AIR)
+                {
+                    wheelRPM = upShiftRPM_ * Random(MIN_WHEEL_RPM_AIR, MAX_WHEEL_RPM_AIR);
+                }
+            }
+            else
+            {
+                wheelRPM = 0.0f;
+            }
+        }
+
+        if ( wheelRPM > curRPM_ ) 
+            curRPM_ = wheelRPM;
+
+        if ( curRPM_ < MIN_IDLE_RPM ) 
+            curRPM_ += minIdleRPM_;
+    }
+}
+
+//=============================================================================
+// sync wheels for rendering - scene frame rate
+//=============================================================================
+void Vehicle::PostUpdate(float timeStep)
+{
+    float curSpdMph = GetSpeedMPH();
+
+    for ( int i = 0; i < raycastVehicle_->GetNumWheels(); i++ )
+    {
+        btWheelInfo &whInfo = raycastVehicle_->GetWheelInfo( i );
 
         // update wheel transform - performed after whInfo.m_rotation is adjusted from above
         raycastVehicle_->UpdateWheelTransform( i, true );
@@ -399,12 +515,6 @@ void Vehicle::PostUpdate(float timeStep)
         Vector3 v3PosLS = ToVector3( whInfo.m_chassisConnectionPointCS );
         Quaternion qRotator = ( v3PosLS.x_ >= 0.0 ? Quaternion(0.0f, 0.0f, -90.0f) : Quaternion(0.0f, 0.0f, 90.0f) );
         pWheel->SetRotation( qRot * qRotator );
-
-        // ground contact
-        if ( whInfo.m_raycastInfo.m_isInContact )
-        {
-            numWheelContacts_++;
-        }
     }
 
     // update sound and wheel effects
@@ -540,13 +650,20 @@ void Vehicle::AutoCorrectPitchRoll()
     }
 }
 
-void Vehicle::LimitAngularVelocity()
+void Vehicle::LimitLinearAndAngularVelocity()
 {
+    // velocity limit
+    Vector3 linVel = raycastVehicle_->GetLinearVelocity();
+    if ( linVel.Length() > MAX_LINEAR_VEL_LIMIT )
+    {
+        raycastVehicle_->SetLinearVelocity( linVel.Normalized() * MAX_LINEAR_VEL_LIMIT );
+    }
+
     // angular velocity limiters
     Vector3 v3AngVel = raycastVehicle_->GetAngularVelocity();
-    v3AngVel.x_ = Clamp( v3AngVel.x_, MIN_ANGULAR_VEL_LIMIT, MAX_ANGULAR_VEL_LIMIT );
-    v3AngVel.y_ = Clamp( v3AngVel.y_, -m_fYAngularVelocity,  m_fYAngularVelocity );
-    v3AngVel.z_ = Clamp( v3AngVel.z_, MIN_ANGULAR_VEL_LIMIT, MAX_ANGULAR_VEL_LIMIT );
+    v3AngVel.x_ = Clamp( v3AngVel.x_, -MAX_ANGULAR_VEL_LIMIT,  MAX_ANGULAR_VEL_LIMIT );
+    v3AngVel.y_ = Clamp( v3AngVel.y_, -m_fYAngularVelocity,    m_fYAngularVelocity );
+    v3AngVel.z_ = Clamp( v3AngVel.z_, -MAX_ANGULAR_VEL_LIMIT,  MAX_ANGULAR_VEL_LIMIT );
     raycastVehicle_->SetAngularVelocity( v3AngVel );
 }
 
@@ -607,7 +724,7 @@ void Vehicle::UpdateDrift()
 
     // set slip
     const float slipConditionValue = slipConditon3;
-    const float slipMax = 0.8f;
+    const float slipMax = MAX_REAR_SLIP;
     
     // for demo purpose, limit the drift speed to provide high speed steering experience w/o any drifting
     const float maxDriftSpeed = 70.0f;
@@ -642,19 +759,13 @@ void Vehicle::UpdateDrift()
 
 void Vehicle::PostUpdateSound(float timeStep)
 {
-    const float hullLinVelocity = raycastVehicle_->GetLinearVelocity().Length();
-    float wheelVelocity = 0.0f;
-    int numPoweredWheels = raycastVehicle_->GetNumWheels();
     int playSkidSound = 0;
+    bool playShockImpactSound = false;
 
-    for ( int i = 0; i < numPoweredWheels; ++i )
+    for ( int i = 0; i < numWheels_; ++i )
     {
         const btWheelInfo &whInfo = raycastVehicle_->GetWheelInfo(i);
 
-        // wheel velocity from rotation
-        // note: raycastVehicle_->GetLinearVelocity().Length() ~= (whInfo.m_deltaRotation * whInfo.m_wheelsRadius)/(M_PI*timeStep)
-        wheelVelocity += (whInfo.m_deltaRotation * whInfo.m_wheelsRadius)/((float)M_PI * timeStep);
-        
         // skid sound
         if ( whInfo.m_raycastInfo.m_isInContact )
         {
@@ -662,7 +773,22 @@ void Vehicle::PostUpdateSound(float timeStep)
             {
                 playSkidSound++;
             }
+
+            // shock impact
+            if ( !prevWheelInContact_[i] )
+            {
+                Vector3 velAtWheel = raycastVehicle_->GetVelocityAtPoint( raycastVehicle_->GetWheelPositionLS(i) );
+                float downLinVel = velAtWheel.DotProduct( Vector3::DOWN );
+
+                if ( downLinVel > MIN_SHOCK_IMPACT_VEL )
+                {
+                    playShockImpactSound = true;
+                }
+            }
         }
+
+        // update prev wheel in contact
+        prevWheelInContact_[i] = whInfo.m_raycastInfo.m_isInContact;
     }
 
     // -ideally, you want the engine sound to sound like it's at 10k rpm w/o any pitch adjustment, and 
@@ -670,31 +796,12 @@ void Vehicle::PostUpdateSound(float timeStep)
     // -if shifting rmps sounds off then change the normalization value. for the engine prototype sound, 
     // the pitch sound is low, so it's normalized by diving by 8k instead of 10k
     const float rpmNormalizedForEnginePrototype = 8000.0f;
-
-    // adjust rpm based on wheel speed
-    if (curGearIdx_ == 0 || numWheelContacts_ == 0)
-    {
-        // average wheel velocity
-        wheelVelocity /= (float)numPoweredWheels;
-
-        // physics velocity to kmh to mph (based on Bullet's calculation for KmH)
-        wheelVelocity = wheelVelocity * 3.6f * KMH_TO_MPH;
-        float wheelRPM = upShiftRPM_ * wheelVelocity / gearShiftSpeed_[curGearIdx_];
-
-        if ( wheelRPM > curRPM_ && wheelRPM < upShiftRPM_) 
-            curRPM_ = wheelRPM;
-        if ( curRPM_ < MIN_IDLE_RPM ) 
-            curRPM_ += minIdleRPM_;
-    }
-
     engineSoundSrc_->SetFrequency(AUDIO_FIXED_FREQ_44K * curRPM_/rpmNormalizedForEnginePrototype);
 
     // shock impact when transitioning from partially off ground (or air borne) to landing
-    if ( prevWheelContacts_ <= 1 && numWheelContacts_ > 1 )
+    if ( prevWheelContacts_ <= 2 && playShockImpactSound )
     {
-        float f3DownLinVel = raycastVehicle_->GetLinearVelocity().DotProduct( -Vector3::UP );
-
-        if ( f3DownLinVel > MIN_SHOCK_IMPACT_VEL )
+        if ( !shockSoundSrc_->IsPlaying() )
         {
             shockSoundSrc_->Play(shockSnd_);
         }
@@ -717,8 +824,9 @@ void Vehicle::PostUpdateSound(float timeStep)
 void Vehicle::PostUpdateWheelEffects()
 {
     float curSpdMph = GetSpeedMPH();
+    Vector3 linVel = raycastVehicle_->GetLinearVelocity();
 
-    for ( int i = 0; i < raycastVehicle_->GetNumWheels(); i++ )
+    for ( int i = 0; i < raycastVehicle_->GetNumWheels(); ++i )
     {
         const btWheelInfo &whInfo = raycastVehicle_->GetWheelInfo( i );
 
@@ -726,7 +834,7 @@ void Vehicle::PostUpdateWheelEffects()
         wheelTrackList_[i]->UpdateWorldPos();
         ParticleEmitter *particleEmitter = particleEmitterNodeList_[i]->GetComponent<ParticleEmitter>();
 
-        if ( whInfo.m_raycastInfo.m_isInContact && whInfo.m_skidInfoCumulative < 0.9f)
+        if ( whInfo.m_raycastInfo.m_isInContact && whInfo.m_skidInfoCumulative < 0.9f )
         {
             Vector3 pos2 = ToVector3(whInfo.m_raycastInfo.m_contactPointWS);
             particleEmitterNodeList_[i]->SetPosition(pos2);
@@ -734,6 +842,10 @@ void Vehicle::PostUpdateWheelEffects()
             if ( curSpdMph < MAX_SKID_TRACK_SPEED )
             {
                 wheelTrackList_[i]->AddStrip( pos2, ToVector3(whInfo.m_raycastInfo.m_contactNormalWS) );
+            }
+            else
+            {
+                wheelTrackList_[i]->ClearStrip();
             }
 
             // emit dust if moving
@@ -762,10 +874,14 @@ void Vehicle::DebugDraw(const Color &color)
     {
         // draw compound shape bounding box (the inertia bbox)
         Vector3 localExtents = raycastVehicle_->GetCompoundLocalExtents();
+        Vector3 localCenter  = raycastVehicle_->GetCompooundLocalExtentsCenter();
         BoundingBox bbox(-localExtents, localExtents);
+
         btTransform trans;
         raycastVehicle_->getWorldTransform(trans);
         Vector3 posWS = ToVector3(trans.getOrigin());
+        Vector3 centerWS = ToQuaternion(trans.getRotation()) * localCenter;
+        posWS += centerWS;
         Matrix3x4 mat34(posWS, ToQuaternion(trans.getRotation()), 1.0f);
 
         dbgRenderer->AddBoundingBox(bbox, mat34, color);

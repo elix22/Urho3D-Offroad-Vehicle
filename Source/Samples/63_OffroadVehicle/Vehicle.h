@@ -78,6 +78,7 @@ public:
 
     /// Handle physics world update. Called by LogicComponent base class.
     virtual void FixedUpdate(float timeStep);
+    virtual void FixedPostUpdate(float timeStep);
     virtual void PostUpdate(float timeStep);
    
     void ResetForces()
@@ -105,7 +106,7 @@ protected:
     void AutoCorrectPitchRoll();
     void UpdateGear();
     void UpdateDrift();
-    void LimitAngularVelocity();
+    void LimitLinearAndAngularVelocity();
     void PostUpdateSound(float timeStep);
     void PostUpdateWheelEffects();
 
@@ -156,6 +157,7 @@ protected:
     int prevWheelContacts_;
     bool isBraking_;
     PODVector<float> gearShiftSpeed_;
+    PODVector<bool>  prevWheelInContact_;
 
     // gears
     float downShiftRPM_;
@@ -172,6 +174,7 @@ protected:
     SharedPtr<SoundSource3D> engineSoundSrc_;
     SharedPtr<SoundSource3D> skidSoundSrc_;
     SharedPtr<SoundSource3D> shockSoundSrc_;
+    bool                     playAccelerationSoundInAir_;
 
     // wheel effects - skid track and particles
     SharedPtr<WheelTrackModel> wheelTrackList_[4];
